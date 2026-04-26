@@ -2,21 +2,29 @@
 import { createClient } from '@supabase/supabase-js';
 import type { Database } from './types';
 
-const DEFAULT_LOCAL_SUPABASE_URL = 'http://127.0.0.1:54321';
 const VITE_SUPABASE_URL = String(import.meta.env.VITE_SUPABASE_URL || '').trim();
 const SUPABASE_PUBLISHABLE_KEY = String(import.meta.env.VITE_SUPABASE_ANON_KEY || '').trim();
-const SUPABASE_URL = VITE_SUPABASE_URL || DEFAULT_LOCAL_SUPABASE_URL;
 
-if (!SUPABASE_PUBLISHABLE_KEY) {
-  throw new Error('Missing VITE_SUPABASE_ANON_KEY for Supabase client initialization.');
+// Fallback to a no-op client when Supabase is not configured so the app
+// can still render in offline / self-hosted deployments without crashing.
+const SUPABASE_URL = VITE_SUPABASE_URL || 'https://placeholder.supabase.co';
+const SUPABASE_KEY = SUPABASE_PUBLISHABLE_KEY || 'placeholder-anon-key';
+
+export const isSupabaseConfigured = Boolean(VITE_SUPABASE_URL && SUPABASE_PUBLISHABLE_KEY);
+
+if (!isSupabaseConfigured) {
+  console.warn(
+    '[BeatAni] Supabase is not configured. Auth, watchlist and social features will be disabled. ' +
+    'Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in your environment to enable them.'
+  );
 }
 
 // Import the supabase client like this:
 // import { supabase } from "@/integrations/supabase/client";
 
-export const supabase = createClient<Database>(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
+export const supabase = createClient<Database>(SUPABASE_URL, SUPABASE_KEY, {
   auth: {
-    storage: localStorage,
+    storage: typeof localStorage !== 'undefined' ? localStorage : undefined,
     persistSession: true,
     autoRefreshToken: true,
   }
