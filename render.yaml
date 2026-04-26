@@ -1,5 +1,4 @@
 # render.yaml — BeatAni deployment config for Render.com
-# Deploy at https://render.com  → New + → Static Site or Web Service
 
 services:
   - type: web
@@ -11,6 +10,8 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "20"
+      - key: VITE_PUBLIC_DOMAIN
+        value: https://beatanikai.onrender.com
       - key: VITE_BACKEND_ORIGIN
         value: https://beat-anime-api-3.onrender.com
       - key: VITE_HIANIME_API_URL
@@ -27,13 +28,15 @@ services:
         value: https://beat-anime-api-3.onrender.com/api/v1/streamingProxy
       - key: VITE_STREAM_PROXY_URL
         value: https://beat-anime-api-3.onrender.com/api/v1/streamingProxy
-      # Add your Supabase keys in Render Dashboard → Environment
-      # - key: VITE_SUPABASE_URL
-      #   value: your_supabase_url
-      # - key: VITE_SUPABASE_ANON_KEY
-      #   value: your_supabase_anon_key
-      # - key: VITE_ADMIN_API_SECRET
-      #   value: your_admin_secret
+      # ⚠️  REQUIRED — set these in Render Dashboard → Environment
+      # Get free Supabase project at https://supabase.com
+      - key: VITE_SUPABASE_URL
+        value: your_supabase_project_url
+      - key: VITE_SUPABASE_ANON_KEY
+        value: your_supabase_anon_key
+      # Must match TATAKAI_ADMIN_API_SECRET in your API's render.yaml
+      - key: VITE_ADMIN_API_SECRET
+        value: your_admin_secret_here
 
     headers:
       - path: /*
@@ -42,7 +45,7 @@ services:
       - path: /*
         name: X-Content-Type-Options
         value: nosniff
-      - path: /*
+      - path: /assets/*
         name: Cache-Control
         value: public, max-age=31536000, immutable
       - path: /index.html
