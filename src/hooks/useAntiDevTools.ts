@@ -5,86 +5,133 @@ import {
   clearDevtoolsTrapState,
   isDevtoolsGuardBypassedHost,
   isDevtoolsLockActive,
-  isLikelyDevtoolsOpenByDebugger,
   persistDevtoolsTrapState,
 } from '@/lib/devtoolsTrap';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TUNING CONSTANTS
-// Each method must fire this many consecutive times before it triggers a
-// redirect. This makes every individual method immune to one-off false triggers.
+// TUNING — adjust these without touching logic
 // ─────────────────────────────────────────────────────────────────────────────
-const VIEWPORT_CONFIRM_COUNT  = 4;    // ~4 s of sustained viewport shrink
-const DEBUGGER_CONFIRM_COUNT  = 3;    // 3 consecutive slow debugger pairs
-const CONSOLE_CONFIRM_COUNT   = 3;    // 3 consecutive console-getter fires
-const VIEWPORT_THRESHOLD      = 380;  // px — typical DevTools panel width/height
-const DEBUGGER_THRESHOLD_MS   = 260;  // ms — generous so suspended tabs are safe
-const TAB_SWITCH_GRACE_MS     = 5000; // ms after tab-switch before checks resume
-const FOCUS_GRACE_MS          = 2500; // ms after alt-tab / screen-switch
-const RESIZE_SETTLE_MS        = 1500; // ms after resize stops before re-checking
+
+/** px – DevTools panels are 300-500 px wide/tall; zoom never reaches this */
+const VIEWPORT_THRESHOLD = 380;
+
+/** How many consecutive 1-second ticks with viewport diff > threshold before redirect */
+const VIEWPORT_CONFIRM_TICKS = 5;
+
+/** How many times console-getter must fire in a row before redirect */
+const CONSOLE_CONFIRM_COUNT = 4;
+
+/** How many times the disable-devtool LIBRARY must fire before redirect.
+ *  Protects against the one spurious event that can happen on tab resume. */
+const LIBRARY_CONFIRM_COUNT = 2;
+
+/** ms after tab hidden before checks resume */
+const TAB_SWITCH_GRACE_MS = 6000;
+
+/** ms after window focus (alt-tab / screen switch) before checks resume */
+const FOCUS_GRACE_MS = 3000;
+
+/** ms after last resize event before viewport baseline is refreshed */
+const RESIZE_SETTLE_MS = 1500;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DETECTION LOG  (in-memory, survives page navigation, cleared on unlock)
+// ─────────────────────────────────────────────────────────────────────────────
+export type DetectionLogEntry = {
+  ts: string;          // ISO timestamp
+  reason: string;      // detection method
+  detail?: string;     // extra context
+  blocked: boolean;    // true = redirect happened
+};
+
+const DETECTION_LOG_KEY = 'tatakai.devtools-detection-log';
+
+function appendDetectionLog(entry: DetectionLogEntry) {
+  try {
+    const raw = sessionStorage.getItem(DETECTION_LOG_KEY);
+    const log: DetectionLogEntry[] = raw ? JSON.parse(raw) : [];
+    log.push(entry);
+    // Keep last 50 entries
+    if (log.length > 50) log.splice(0, log.length - 50);
+    sessionStorage.setItem(DETECTION_LOG_KEY, JSON.stringify(log));
+  } catch { /* ignore storage errors */ }
+}
+
+function logDetection(reason: string, detail: string, blocked: boolean) {
+  const entry: DetectionLogEntry = {
+    ts: new Date().toISOString(),
+    reason,
+    detail,
+    blocked,
+  };
+  appendDetectionLog(entry);
+  // Keep a developer-facing console trace (suppressed in production by production.ts)
+  // eslint-disable-next-line no-console
+  console.warn('[AntiDevTools]', reason, '|', detail, '| blocked:', blocked);
+}
+
+/** Public helper – other parts of the app can read the log for admin display */
+export function readDetectionLog(): DetectionLogEntry[] {
+  try {
+    const raw = sessionStorage.getItem(DETECTION_LOG_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch { return []; }
+}
+
+export function clearDetectionLog() {
+  try { sessionStorage.removeItem(DETECTION_LOG_KEY); } catch { /* ignore */ }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MAIN HOOK
+// ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Detects open developer tools and redirects to the blocked page.
+ * Detects open developer tools and redirects to /devtools-blocked.
  *
- * IMPROVEMENTS OVER THE ORIGINAL:
+ * FALSE-POSITIVE GUARANTEES
+ * ─────────────────────────
+ * ✔ Zoom in / out         → DPR change detected → baseline refreshed, skipped
+ * ✔ Window resize / snap  → outerWidth change   → baseline refreshed, skipped
+ *                           + checks paused during active resize
+ * ✔ Tab switch            → 6 s grace period after tab goes hidden + all
+ *                           counters reset
+ * ✔ Alt-Tab / screen sw.  → 3 s grace period on focus + counter reset
+ * ✔ Slow device / battery → debugger-timing detector fully removed
+ * ✔ Lib spurious event    → library must fire LIBRARY_CONFIRM_COUNT times
+ *                           AND not be in a grace period before redirect
  *
- * 1. ZOOM-SAFE viewport check
- *    – Captures a baseline (outerWidth, outerHeight, devicePixelRatio) on mount
- *      and after every genuine window resize.
- *    – Flags ONLY when outerWidth is stable AND DPR is stable but innerWidth
- *      has shrunk by > VIEWPORT_THRESHOLD px — the exact fingerprint of a docked
- *      DevTools panel, not zoom.
- *    – When DPR or outerWidth changes (zoom / display change / snap), the
- *      baseline is refreshed automatically so the next measurement is clean.
- *
- * 2. SUSTAINED-confirmation for every heuristic method
- *    – A single positive reading no longer triggers a redirect.
- *    – Each method keeps its own hit-counter that increments on a positive and
- *      decrements on a negative. Redirect fires only when counter reaches
- *      its CONFIRM_COUNT — filters out momentary glitches completely.
- *
- * 3. GRACE PERIODS for normal browser interactions
- *    – Tab switch  (visibilitychange → hidden) : 5 s grace + counter reset.
- *    – Alt-Tab / screen switch (focus)         : 2.5 s grace + counter reset.
- *    – Window resize : checks pause; baseline refreshed 1.5 s after last event.
- *
- * 4. DUAL-SAMPLE debugger timing
- *    – Two back-to-back samples must both be slow before the counter increments.
- *      A single slow sample (suspended / throttled tab) is ignored.
- *
- * 5. disable-devtool library — all non-size/non-perf detectors enabled
- *    – Detector 0 (size) excluded: zoom-sensitive.
- *    – Detector 7 (performance) excluded: slow-device-sensitive.
- *    – Detectors 1–6 run at 1.5 s intervals and fire an immediate redirect.
- *
- * 6. Keyboard shortcuts → immediate redirect (certainty = 100 %).
+ * WHAT STILL CATCHES REAL DEVTOOLS
+ * ─────────────────────────────────
+ * • disable-devtool library  detectors 2-6 (toString, defineId, date,
+ *   function, canvas) — unaffected by zoom / tab / resize
+ * • Viewport shrink sustained for VIEWPORT_CONFIRM_TICKS seconds
+ * • console-getter fired CONSOLE_CONFIRM_COUNT times in a row
+ * • Keyboard shortcuts (F12, Ctrl+Shift+I/J/C/K, Ctrl+U) → instant
+ * • All checks log to sessionStorage for admin inspection
  */
 export function useAntiDevTools() {
-  const navigate    = useNavigate();
-  const isDesktop   = useIsDesktopApp();
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const triggeredRef = useRef(false);
-  const disableDevtoolRef = useRef<any>(null);
+  const navigate  = useNavigate();
+  const isDesktop = useIsDesktopApp();
 
-  // Sustained hit counters — each method manages its own
-  const viewportHitsRef = useRef(0);
-  const debuggerHitsRef = useRef(0);
-  const consoleHitsRef  = useRef(0);
-  const tickCountRef    = useRef(0);
+  // refs never cause re-renders
+  const intervalRef        = useRef<ReturnType<typeof setInterval> | null>(null);
+  const triggeredRef       = useRef(false);
+  const disableDevtoolRef  = useRef<any>(null);
 
-  // Grace-period state
+  // Per-method hit counters
+  const viewportHitsRef  = useRef(0);
+  const consoleHitsRef   = useRef(0);
+  const libraryHitsRef   = useRef(0);
+  const tickCountRef     = useRef(0);
+
+  // Grace-period + resize state
   const gracePeriodUntilRef  = useRef(0);
   const resizingRef          = useRef(false);
-  const resizeSettleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const resizeTimerRef       = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Stable baseline captured at mount & after every genuine window resize
-  const baselineRef = useRef({
-    outerWidth:  0,
-    outerHeight: 0,
-    innerWidth:  0,
-    innerHeight: 0,
-    dpr:         1,
-  });
+  // Stable dimension baseline
+  const baselineRef = useRef({ outerW: 0, outerH: 0, dpr: 1 });
 
   useEffect(() => {
     if (isDesktop) return;
@@ -99,115 +146,109 @@ export function useAntiDevTools() {
       return;
     }
 
-    // ── Capture baseline ──────────────────────────────────────────────
+    // ── Baseline helpers ──────────────────────────────────────────────
     const captureBaseline = () => {
       baselineRef.current = {
-        outerWidth:  window.outerWidth,
-        outerHeight: window.outerHeight,
-        innerWidth:  window.innerWidth,
-        innerHeight: window.innerHeight,
-        dpr:         window.devicePixelRatio,
+        outerW: window.outerWidth,
+        outerH: window.outerHeight,
+        dpr:    window.devicePixelRatio,
       };
-      viewportHitsRef.current = 0;
+      viewportHitsRef.current = 0; // reset on every baseline shift
     };
     captureBaseline();
 
-    // ── Redirect helper ───────────────────────────────────────────────
-    const redirect = (reason: string) => {
+    // ── Grace helpers ─────────────────────────────────────────────────
+    const isInGracePeriod = () => Date.now() < gracePeriodUntilRef.current;
+
+    const setGracePeriod = (ms: number, source: string) => {
+      gracePeriodUntilRef.current = Date.now() + ms;
+      logDetection('grace-period-set', source, false);
+      // Reset ALL counters — noise before the gap is irrelevant
+      viewportHitsRef.current = 0;
+      consoleHitsRef.current  = 0;
+      libraryHitsRef.current  = 0;
+    };
+
+    // ── Redirect ──────────────────────────────────────────────────────
+    const redirect = (reason: string, detail = '') => {
+      logDetection(reason, detail, true);
       const payload = persistDevtoolsTrapState(reason);
+
       if (window.location.pathname === '/devtools-blocked') {
         triggeredRef.current = true;
         return;
       }
       if (triggeredRef.current) return;
       triggeredRef.current = true;
-      // eslint-disable-next-line no-console
-      console.error(JSON.stringify(payload, null, 2));
+
       navigate('/devtools-blocked', { replace: true, state: { trapPayload: payload } });
     };
 
     if (isDevtoolsLockActive() && window.location.pathname !== '/devtools-blocked') {
-      redirect('lock-active');
+      redirect('lock-active', 'previous session lock still valid');
       return;
     }
 
-    // ── Grace-period helpers ──────────────────────────────────────────
-    const isInGracePeriod = () => Date.now() < gracePeriodUntilRef.current;
-
-    const setGracePeriod = (ms: number) => {
-      gracePeriodUntilRef.current = Date.now() + ms;
-      // Reset all counters so noise from before the gap is discarded
-      viewportHitsRef.current = 0;
-      debuggerHitsRef.current = 0;
-      consoleHitsRef.current  = 0;
-    };
-
     // ─────────────────────────────────────────────────────────────────
-    // METHOD 1 · Viewport-size (zoom-safe, baseline-relative, sustained)
+    // METHOD 1 · Viewport size  (zoom-safe, baseline-relative, sustained)
     //
-    // DevTools opens on the SIDE  → outerWidth stays, innerWidth  shrinks.
-    // DevTools opens on the BOTTOM → outerHeight stays, innerHeight shrinks.
-    // Zoom IN/OUT              → DPR changes OR outerWidth changes too.
-    // Window resize            → outerWidth changes  → baseline refreshed.
+    // ZOOM false-positive prevention:
+    //   In every browser, Ctrl+/- changes window.devicePixelRatio in
+    //   proportion to the zoom level. If DPR shifted even slightly, we
+    //   treat this as a zoom/display event and refresh the baseline.
+    //
+    //   Additionally: if outerWidth itself changed, that's a window
+    //   resize — also refresh baseline.
+    //
+    //   Only when both outerWidth AND dpr are stable but innerWidth
+    //   shrank do we count a DevTools hit.
     // ─────────────────────────────────────────────────────────────────
     const checkViewport = (): boolean => {
       if (resizingRef.current) return false;
 
-      const dpr = window.devicePixelRatio;
+      const dpr    = window.devicePixelRatio;
+      const dprDelta = Math.abs(dpr - baselineRef.current.dpr);
 
-      // DPR changed → zoom or display switch → refresh baseline and skip
-      if (Math.abs(dpr - baselineRef.current.dpr) > 0.05) {
+      if (dprDelta > 0.04) {
+        // DPR changed → zoom or display scaling change → update baseline
+        logDetection('viewport-baseline-refresh', `dpr ${baselineRef.current.dpr} → ${dpr}`, false);
         captureBaseline();
         return false;
       }
 
-      // outerWidth / outerHeight changed → genuine window resize → refresh baseline
-      if (
-        Math.abs(window.outerWidth  - baselineRef.current.outerWidth)  > 20 ||
-        Math.abs(window.outerHeight - baselineRef.current.outerHeight) > 20
-      ) {
+      const outerWDelta = Math.abs(window.outerWidth  - baselineRef.current.outerW);
+      const outerHDelta = Math.abs(window.outerHeight - baselineRef.current.outerH);
+
+      if (outerWDelta > 20 || outerHDelta > 20) {
+        // outerWidth changed → genuine window resize → update baseline
+        logDetection('viewport-baseline-refresh', `outerW ${baselineRef.current.outerW} → ${window.outerWidth}`, false);
         captureBaseline();
         return false;
       }
 
-      // outerWidth stable, DPR stable, but innerWidth fell → DevTools fingerprint
-      const shrinkW = baselineRef.current.outerWidth  - window.innerWidth;
-      const shrinkH = baselineRef.current.outerHeight - window.innerHeight;
+      // outerW stable + DPR stable + innerW shrank → DevTools docked
+      const shrinkW = baselineRef.current.outerW - window.innerWidth;
+      const shrinkH = baselineRef.current.outerH - window.innerHeight;
 
       if (shrinkW > VIEWPORT_THRESHOLD || shrinkH > VIEWPORT_THRESHOLD) {
         viewportHitsRef.current++;
+        logDetection(
+          'viewport-hit',
+          `shrinkW=${shrinkW} shrinkH=${shrinkH} hits=${viewportHitsRef.current}/${VIEWPORT_CONFIRM_TICKS}`,
+          false,
+        );
       } else {
         viewportHitsRef.current = Math.max(0, viewportHitsRef.current - 1);
       }
 
-      return viewportHitsRef.current >= VIEWPORT_CONFIRM_COUNT;
+      return viewportHitsRef.current >= VIEWPORT_CONFIRM_TICKS;
     };
 
     // ─────────────────────────────────────────────────────────────────
-    // METHOD 2 · Debugger timing (dual-sample, sustained)
+    // METHOD 2 · console-getter  (sustained)
     //
-    // DevTools slows down the `debugger` statement significantly.
-    // Two consecutive slow samples are required to increment the counter,
-    // preventing a single slow event (throttled/re-activated tab) from firing.
-    // ─────────────────────────────────────────────────────────────────
-    const checkDebuggerTiming = (): boolean => {
-      const slow1 = isLikelyDevtoolsOpenByDebugger(DEBUGGER_THRESHOLD_MS);
-      const slow2 = isLikelyDevtoolsOpenByDebugger(DEBUGGER_THRESHOLD_MS);
-
-      if (slow1 && slow2) {
-        debuggerHitsRef.current++;
-      } else {
-        debuggerHitsRef.current = Math.max(0, debuggerHitsRef.current - 1);
-      }
-
-      return debuggerHitsRef.current >= DEBUGGER_CONFIRM_COUNT;
-    };
-
-    // ─────────────────────────────────────────────────────────────────
-    // METHOD 3 · console-getter object (sustained)
-    //
-    // DevTools eagerly expands objects in the console, triggering getters.
-    // Requires CONSOLE_CONFIRM_COUNT consecutive positives.
+    // DevTools eagerly calls getters on objects logged to the console.
+    // Requires CONSOLE_CONFIRM_COUNT consecutive fires.
     // ─────────────────────────────────────────────────────────────────
     let consoleGetterFired = false;
     const detectObj = Object.defineProperty({}, '_', {
@@ -218,36 +259,69 @@ export function useAntiDevTools() {
       consoleGetterFired = false;
       // eslint-disable-next-line no-console
       console.log('%c', detectObj);
+
       if (consoleGetterFired) {
         consoleHitsRef.current++;
+        logDetection(
+          'console-getter-hit',
+          `hits=${consoleHitsRef.current}/${CONSOLE_CONFIRM_COUNT}`,
+          false,
+        );
       } else {
         consoleHitsRef.current = Math.max(0, consoleHitsRef.current - 1);
       }
+
       return consoleHitsRef.current >= CONSOLE_CONFIRM_COUNT;
     };
 
     // ─────────────────────────────────────────────────────────────────
-    // PRIMARY · disable-devtool library (immediate, high-confidence)
+    // PRIMARY · disable-devtool library  (high-confidence, confirmed)
+    //
+    // NOTE: Detector 0 (size) excluded — zoom-sensitive.
+    //       Detector 1 (debugger timing) excluded — triggers on tab
+    //         resume when JS was suspended (false positive on tab switch).
+    //       Detector 7 (performance) excluded — slow-device-sensitive.
+    //
+    //       Remaining: 2 toString · 3 defineId · 4 date · 5 function · 6 canvas
+    //
+    // CONFIRMATION: the library must fire LIBRARY_CONFIRM_COUNT times
+    // outside of any grace period before we redirect. This absorbs the
+    // one spurious event that occasionally fires on page load or focus.
     // ─────────────────────────────────────────────────────────────────
     import('disable-devtool').then((mod) => {
       const DisableDevtool: any = mod.default;
       disableDevtoolRef.current = DisableDevtool({
-        ondevtoolopen: (_type: string) => {
-          redirect('disable-devtool-detector');
+        ondevtoolopen: (type: string) => {
+          // Ignore if we're still in a grace period
+          if (isInGracePeriod()) {
+            logDetection('library-skipped-grace', `type=${type}`, false);
+            return;
+          }
+
+          libraryHitsRef.current++;
+          logDetection(
+            'library-hit',
+            `type=${type} hits=${libraryHitsRef.current}/${LIBRARY_CONFIRM_COUNT}`,
+            false,
+          );
+
+          if (libraryHitsRef.current >= LIBRARY_CONFIRM_COUNT) {
+            redirect('library-confirmed', `type=${type}`);
+          }
         },
         disableMenu:          true,
         clearLog:             true,
         clearIntervalWhenDev: false,
         interval:             1500,
-        // 0 = size (zoom-sensitive)  →  EXCLUDED
-        // 7 = performance            →  EXCLUDED (slow devices)
-        // 1 debugger · 2 toString · 3 defineId · 4 date · 5 function · 6 canvas
-        detectors: [1, 2, 3, 4, 5, 6],
+        detectors: [2, 3, 4, 5, 6],
+        // 0 size       → EXCLUDED (zoom)
+        // 1 debugger   → EXCLUDED (tab-resume false positive)
+        // 7 performance → EXCLUDED (slow device)
       });
-    }).catch(() => { /* Fall back to manual checks only */ });
+    }).catch(() => { /* fall back to manual checks */ });
 
     // ─────────────────────────────────────────────────────────────────
-    // POLLING LOOP  (1 s interval)
+    // POLLING LOOP  (1 s tick)
     // ─────────────────────────────────────────────────────────────────
     const runChecks = () => {
       if (triggeredRef.current) {
@@ -256,30 +330,29 @@ export function useAntiDevTools() {
       }
 
       if (isDevtoolsLockActive() && window.location.pathname !== '/devtools-blocked') {
-        redirect('lock-active');
+        redirect('lock-active-poll', 'detected on tick');
         return;
       }
 
-      // Skip all heuristics during grace periods or active resize
       if (isInGracePeriod() || resizingRef.current) return;
 
       tickCountRef.current++;
 
-      // Viewport: every tick  (lightweight — just math)
-      if (checkViewport()) { redirect('viewport-sustained'); return; }
-
-      // Console getter: every 4 ticks  (reduces log noise)
-      if (tickCountRef.current % 4 === 0) {
-        if (checkConsole()) { redirect('console-getter-sustained'); return; }
+      if (checkViewport()) {
+        redirect('viewport-sustained', `after ${VIEWPORT_CONFIRM_TICKS}s`);
+        return;
       }
 
-      // Debugger timing: every 7 ticks  (CPU-intensive — keep infrequent)
-      if (tickCountRef.current % 7 === 0) {
-        if (checkDebuggerTiming()) { redirect('debugger-timing-sustained'); }
+      // Console getter: every 4 ticks
+      if (tickCountRef.current % 4 === 0) {
+        if (checkConsole()) {
+          redirect('console-getter-sustained', `after ${CONSOLE_CONFIRM_COUNT} fires`);
+          return;
+        }
       }
     };
 
-    // Let page fully settle before first probe
+    // Give the page 2 s to settle fully before first probe
     const initTimer = setTimeout(() => {
       if (!triggeredRef.current && !isInGracePeriod()) checkConsole();
     }, 2000);
@@ -290,26 +363,33 @@ export function useAntiDevTools() {
     // EVENT LISTENERS
     // ─────────────────────────────────────────────────────────────────
 
-    // Resize: pause, then refresh baseline after window settles
+    // Resize: pause checks, then refresh baseline once stable
     const handleResize = () => {
-      resizingRef.current = true;
-      viewportHitsRef.current = 0;
-      if (resizeSettleTimerRef.current) clearTimeout(resizeSettleTimerRef.current);
-      resizeSettleTimerRef.current = setTimeout(() => {
-        captureBaseline();          // New size is now the normal state
+      if (!resizingRef.current) {
+        resizingRef.current = true;
+        viewportHitsRef.current = 0;
+      }
+      if (resizeTimerRef.current) clearTimeout(resizeTimerRef.current);
+      resizeTimerRef.current = setTimeout(() => {
+        captureBaseline();
         resizingRef.current = false;
+        logDetection('resize-baseline-refresh', `outerW=${window.outerWidth} dpr=${window.devicePixelRatio}`, false);
       }, RESIZE_SETTLE_MS);
     };
 
-    // Tab switch → page hidden: long grace + reset
+    // Tab becomes hidden → start long grace + reset counters
     const handleVisibility = () => {
-      if (document.visibilityState === 'hidden') setGracePeriod(TAB_SWITCH_GRACE_MS);
+      if (document.visibilityState === 'hidden') {
+        setGracePeriod(TAB_SWITCH_GRACE_MS, 'tab-hidden');
+      }
     };
 
-    // Alt-Tab / screen switch → window focus: short grace + reset
-    const handleFocus = () => setGracePeriod(FOCUS_GRACE_MS);
+    // Window regains focus (alt-tab / screen switch) → short grace + reset
+    const handleFocus = () => {
+      setGracePeriod(FOCUS_GRACE_MS, 'window-focus');
+    };
 
-    // Keyboard shortcuts: immediate redirect (no ambiguity)
+    // Keyboard shortcuts → instant redirect (100 % certainty)
     const handleKeydown = (event: KeyboardEvent) => {
       const key      = event.key.toLowerCase();
       const ctrlLike = event.ctrlKey || event.metaKey;
@@ -322,7 +402,7 @@ export function useAntiDevTools() {
       if (blocked) {
         event.preventDefault();
         event.stopPropagation();
-        redirect(`blocked-shortcut-${key}`);
+        redirect(`shortcut-${key}`, `ctrl=${ctrlLike} shift=${event.shiftKey}`);
       }
     };
 
@@ -333,8 +413,8 @@ export function useAntiDevTools() {
 
     return () => {
       clearTimeout(initTimer);
-      if (intervalRef.current)          clearInterval(intervalRef.current);
-      if (resizeSettleTimerRef.current) clearTimeout(resizeSettleTimerRef.current);
+      if (intervalRef.current)   clearInterval(intervalRef.current);
+      if (resizeTimerRef.current) clearTimeout(resizeTimerRef.current);
       window.removeEventListener('resize', handleResize);
       document.removeEventListener('visibilitychange', handleVisibility);
       window.removeEventListener('focus', handleFocus);
