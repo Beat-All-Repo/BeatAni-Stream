@@ -27,6 +27,7 @@ export default defineConfig(({ mode }) => {
     base: isElectronBuild ? './' : '/',
     resolve: {
       alias: {
+        "@/components": path.resolve(__dirname, "./components"),
         "@": path.resolve(__dirname, "./src"),
       },
     },
