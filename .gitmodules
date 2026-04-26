@@ -1,0 +1,3 @@
+[submodule "BeatAPI"]
+	path = BeatAPI
+	url = https://github.com/Beat-All-Repo/BeatAPI
