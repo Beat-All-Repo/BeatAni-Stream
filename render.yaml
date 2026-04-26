@@ -3,7 +3,7 @@
 
 services:
   - type: web
-    name: beatani-web
+    name: beatani-hub
     runtime: node
     plan: free
     buildCommand: npm install && npm run build
