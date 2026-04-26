@@ -1,0 +1,72 @@
+import { supabase } from '@/integrations/supabase/client';
+import { notifyError } from '@/services/discordWebhook';
+
+function generateErrorId() {
+  return `err_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,8)}`;
+}
+
+export async function logClientError(err: unknown, context: Record<string, any> = {}) {
+  try {
+    const errorId = generateErrorId();
+
+    const message = err instanceof Error ? err.message : String(err || 'Unknown error');
+    const stack = err instanceof Error ? err.stack : undefined;
+
+    // Try to get currently logged-in user id if available
+    let userId: string | null = null;
+    try {
+      // supabase.auth.getUser is async
+      // It returns { data: { user }, error }
+      const res = await (supabase.auth as any).getUser?.();
+      userId = res?.data?.user?.id ?? null;
+    } catch (e) {
+      // noop
+    }
+
+    const details = {
+      error_id: errorId,
+      message,
+      stack,
+      url: typeof window !== 'undefined' ? window.location.href : null,
+      userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : null,
+      context,
+    };
+
+    // Frontend errors are intentionally NOT persisted to admin_logs/staff logs by default.
+    // Keep an explicit opt-in switch for exceptional debugging sessions.
+    const shouldPersistToAdminLogs = import.meta.env.VITE_LOG_FRONTEND_ERRORS_TO_DB === 'true';
+    if (shouldPersistToAdminLogs) {
+      await supabase.from('admin_logs').insert({
+        user_id: userId,
+        action: 'client_error',
+        entity_type: 'frontend',
+        entity_id: null,
+        details,
+      });
+    }
+
+    const isLocalhost = typeof window !== 'undefined' && /^(localhost|127\.0\.0\.1)$/i.test(window.location.hostname);
+    const enableDiscordLogging = (import.meta.env.PROD && !isLocalhost) || import.meta.env.VITE_ENABLE_DISCORD_WEBHOOKS === 'true';
+
+    if (enableDiscordLogging) {
+      // Also notify Discord error channel in production or when explicitly enabled.
+      notifyError({
+        message,
+        stack,
+        url: details.url || undefined,
+        userId: userId || undefined,
+        context: context ? JSON.stringify(context).slice(0, 500) : undefined,
+      });
+    }
+
+    return { errorId };
+  } catch (e) {
+    // If even logging fails, swallow the error silently. We don't want to break the app.
+    try {
+      // Best-effort: send to console in non-production
+      // eslint-disable-next-line no-console
+      console.warn('[logClientError] failed to record error', e);
+    } catch {}
+    return undefined;
+  }
+}
